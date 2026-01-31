@@ -3,8 +3,7 @@ services:
     build: .
     container_name: claudecode2api-buffer
     restart: unless-stopped
-    ports:
-      - "${PORT:-3856}:3856"
+    network_mode: host
     volumes:
       - buffer-data:/data
       - ./config:/config
