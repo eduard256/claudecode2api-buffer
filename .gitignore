@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 /data/
 .venv/
+/config/*
+!/config/*.example
+test_flow.py

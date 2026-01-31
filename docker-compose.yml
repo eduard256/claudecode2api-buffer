@@ -7,7 +7,7 @@ services:
       - "${PORT:-3856}:3856"
     volumes:
       - buffer-data:/data
-      - ./config:/config:ro
+      - ./config:/config
     env_file:
       - .env
     environment:
