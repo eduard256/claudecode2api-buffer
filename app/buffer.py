@@ -3,8 +3,8 @@ Message buffer with state machine for claudecode2api-buffer.
 
 Implements the core buffering logic: accumulates incoming messages,
 manages timers, transitions between IDLE/BUFFERING/PROCESSING states,
-handles pending messages during active Claude processing, and
-orchestrates cancellation when new messages arrive during long requests.
+queues pending batches during active Claude processing, and dispatches
+them sequentially after the current request completes.
 
 Thread-safety is achieved via asyncio locks since all operations
 run in a single event loop.
@@ -29,15 +29,16 @@ class MessageBuffer:
     """
     Central state machine managing message buffering and Claude API dispatch.
 
-    Maintains two buffers (current and pending), two timers, session persistence,
-    batch history, and the current Claude response accumulator. All public methods
-    are async-safe via an internal asyncio.Lock.
+    Maintains a current buffer for accumulating messages, a pending buffer
+    for messages arriving during PROCESSING, and a dispatch queue for
+    batches waiting to be sent. Claude always runs to completion -- no
+    cancellation. Queued batches dispatch sequentially.
 
     Attributes:
         state: Current state of the buffer (IDLE, BUFFERING, PROCESSING).
         current_buffer: Messages waiting to be sent in the current batch.
-        pending_buffer: Messages received while Claude is processing.
-        history: List of completed/cancelled batch records.
+        pending_buffer: Messages accumulating while Claude is processing.
+        history: List of completed batch records.
         current_response: Accumulated response from the active Claude call.
         current_tool_calls: Tool invocations from the active Claude call.
         processing_started_at: Timestamp when current processing began.
@@ -47,12 +48,12 @@ class MessageBuffer:
         self.state = BufferState.IDLE
         self.current_buffer: list[str] = []
         self.pending_buffer: list[str] = []
+        self._pending_queue: list[list[str]] = []
         self._timer: asyncio.TimerHandle | None = None
         self._pending_timer: asyncio.TimerHandle | None = None
         self._timer_deadline: float | None = None
         self._pending_timer_deadline: float | None = None
         self._lock = asyncio.Lock()
-        self._process_id: str | None = None
         self._batch_counter = 0
         self.history: list[BatchRecord] = []
         self.current_response: str | None = None
@@ -60,7 +61,7 @@ class MessageBuffer:
         self.processing_started_at: str | None = None
         self._processing_task: asyncio.Task | None = None
 
-    # ── Session persistence ──────────────────────────────────────────
+    # -- Session persistence ------------------------------------------------
 
     def _load_session_id(self) -> str | None:
         """
@@ -107,7 +108,7 @@ class MessageBuffer:
         """Current session_id from persistent storage."""
         return self._load_session_id()
 
-    # ── Timer helpers ────────────────────────────────────────────────
+    # -- Timer helpers ------------------------------------------------------
 
     def _start_timer(self) -> None:
         """Start or reset the main buffer timer to BUFFER_TIMEOUT seconds."""
@@ -171,7 +172,7 @@ class MessageBuffer:
         remaining = self._pending_timer_deadline - loop.time()
         return max(0.0, remaining)
 
-    # ── State transitions ────────────────────────────────────────────
+    # -- State transitions --------------------------------------------------
 
     def _set_state(self, new_state: BufferState) -> None:
         """
@@ -182,9 +183,9 @@ class MessageBuffer:
         """
         old = self.state
         self.state = new_state
-        logger.info("STATE: %s → %s", old.value, new_state.value)
+        logger.info("STATE: %s -> %s", old.value, new_state.value)
 
-    # ── Public: add message ──────────────────────────────────────────
+    # -- Public: add message ------------------------------------------------
 
     async def add_message(self, text: str) -> None:
         """
@@ -211,7 +212,7 @@ class MessageBuffer:
                 logger.info("MESSAGE IN (pending): %s", text[:100])
                 logger.info("PENDING TIMER RESET: %d sec", config.buffer_timeout)
 
-    # ── Timer callbacks ──────────────────────────────────────────────
+    # -- Timer callbacks ----------------------------------------------------
 
     async def _on_timer_expired(self) -> None:
         """
@@ -220,9 +221,7 @@ class MessageBuffer:
         Takes the current_buffer messages, clears the buffer, transitions
         to PROCESSING, and dispatches to Claude in a background task.
         """
-        logger.info("DEBUG TIMER_EXPIRED: acquiring lock...")
         async with self._lock:
-            logger.info("DEBUG TIMER_EXPIRED: lock acquired")
             self._timer = None
             self._timer_deadline = None
             if not self.current_buffer:
@@ -238,37 +237,38 @@ class MessageBuffer:
 
     async def _on_pending_timer_expired(self) -> None:
         """
-        Called when the pending buffer timer expires.
+        Called when the pending buffer timer expires during PROCESSING.
 
-        If Claude is still processing, cancels the active request first.
-        Then moves pending_buffer messages to be sent as a new batch.
+        Moves pending_buffer messages into the dispatch queue. If Claude
+        has already finished (task is done), dispatches immediately.
+        Otherwise the batch waits in queue for _after_processing to pick up.
         """
-        logger.info("DEBUG PENDING_EXPIRED: acquiring lock...")
+        send_now = None
         async with self._lock:
-            logger.info("DEBUG PENDING_EXPIRED: lock acquired")
             self._pending_timer = None
             self._pending_timer_deadline = None
             if not self.pending_buffer:
-                logger.info("DEBUG PENDING_EXPIRED: buffer empty, returning")
                 return
 
             messages = list(self.pending_buffer)
             self.pending_buffer.clear()
-            logger.info("PENDING TIMER EXPIRED: sending %d messages", len(messages))
 
-            # If claude is still working, cancel it
-            if self.state == BufferState.PROCESSING and self._processing_task and not self._processing_task.done():
-                logger.info("PENDING TIMER EXPIRED: claude still active, calling _cancel_current...")
-                logger.info("DEBUG PENDING_EXPIRED: about to await _cancel_current INSIDE lock (DEADLOCK RISK)")
-                await self._cancel_current()
-                logger.info("DEBUG PENDING_EXPIRED: _cancel_current returned")
+            # If Claude already finished, dispatch immediately
+            task_done = self._processing_task is None or self._processing_task.done()
+            if task_done:
+                logger.info("PENDING BATCH READY: %d messages, claude idle, sending now",
+                            len(messages))
+                self._set_state(BufferState.PROCESSING)
+                send_now = messages
+            else:
+                self._pending_queue.append(messages)
+                logger.info("PENDING BATCH QUEUED: %d messages (queue depth: %d)",
+                            len(messages), len(self._pending_queue))
 
-            self._set_state(BufferState.PROCESSING)
-        logger.info("DEBUG PENDING_EXPIRED: lock released")
+        if send_now:
+            await self._send_to_claude(send_now)
 
-        await self._send_to_claude(messages)
-
-    # ── Claude dispatch ──────────────────────────────────────────────
+    # -- Claude dispatch ----------------------------------------------------
 
     async def _send_to_claude(self, messages: list[str]) -> None:
         """
@@ -276,7 +276,7 @@ class MessageBuffer:
 
         Joins messages with newlines, sends via claude_client.send_chat(),
         saves the session_id, records the batch in history, and transitions
-        back to IDLE or processes pending messages.
+        back to IDLE or dispatches the next queued batch.
 
         Args:
             messages: List of message strings to send as a single prompt.
@@ -299,36 +299,26 @@ class MessageBuffer:
 
         async def _run() -> None:
             try:
-                logger.info("DEBUG RUN: starting send_chat for batch #%d", batch.id)
                 result = await claude_client.send_chat(
                     prompt=prompt,
                     session_id=session_id,
                     on_text=lambda t: self._on_claude_text(t),
                     on_tool_use=lambda tool, inp: self._on_claude_tool(tool, inp),
                 )
-                logger.info("DEBUG RUN: send_chat returned for batch #%d", batch.id)
                 # Save session_id
                 if result.session_id:
                     self._save_session_id(result.session_id)
 
-                self._process_id = result.process_id
-
                 # Update batch record
                 batch.completed_at = datetime.now(timezone.utc).isoformat()
                 batch.response = result.text
-                batch.cancelled = result.cancelled
 
-            except asyncio.CancelledError:
-                batch.cancelled = True
-                logger.info("CLAUDE CANCELLED by pending timer (batch #%d)", batch.id)
             except Exception as e:
                 logger.error("CLAUDE ERROR (batch #%d): %s", batch.id, e)
                 batch.response = f"Error: {e}"
                 batch.completed_at = datetime.now(timezone.utc).isoformat()
             finally:
-                logger.info("DEBUG RUN: finally block, about to call _after_processing (batch #%d)", batch.id)
                 await self._after_processing()
-                logger.info("DEBUG RUN: _after_processing returned (batch #%d)", batch.id)
 
         self._processing_task = asyncio.create_task(_run())
 
@@ -347,73 +337,37 @@ class MessageBuffer:
 
     async def _after_processing(self) -> None:
         """
-        Post-processing after Claude finishes or is cancelled.
+        Post-processing after Claude finishes.
 
-        If pending_buffer has messages and pending_timer is still running,
-        waits for it. If pending_buffer is empty, transitions to IDLE.
+        Checks the dispatch queue and pending buffer to decide next action:
+        1. Queue has batches -> pop first and send immediately.
+        2. Queue empty but pending_buffer has messages (timer running) -> stay
+           PROCESSING and wait for the pending timer to queue them.
+        3. Everything empty -> transition to IDLE.
         """
-        logger.info("DEBUG AFTER_PROCESSING: acquiring lock...")
         async with self._lock:
-            logger.info("DEBUG AFTER_PROCESSING: lock acquired")
             self._processing_task = None
             self.current_response = None
             self.current_tool_calls = []
             self.processing_started_at = None
 
+            # Dispatch next queued batch if available
+            if self._pending_queue:
+                messages = self._pending_queue.pop(0)
+                logger.info("QUEUE DISPATCH: %d messages (remaining in queue: %d)",
+                            len(messages), len(self._pending_queue))
+                self._set_state(BufferState.PROCESSING)
+                # Schedule send outside of lock via ensure_future
+                asyncio.ensure_future(self._send_to_claude(messages))
+                return
+
+            # Pending buffer still accumulating (timer running), wait for it
             if self.pending_buffer:
-                logger.info("PENDING BUFFER NOT EMPTY: waiting for timer (pending_timer=%s)",
-                            "active" if self._pending_timer else "None")
-                # pending timer is already running, just stay in a transitional state
-                # When pending timer fires, it will send the messages
-                if self._pending_timer is None:
-                    # Timer already expired while we were processing, send now
-                    messages = list(self.pending_buffer)
-                    self.pending_buffer.clear()
-                    self._set_state(BufferState.PROCESSING)
-                    logger.info("DEBUG AFTER_PROCESSING: firing _send_to_claude via ensure_future")
-                    # Release lock before sending
-                    asyncio.ensure_future(self._send_to_claude(messages))
-                    logger.info("DEBUG AFTER_PROCESSING: lock releasing (ensure_future path)")
-                    return
-                # Otherwise keep PROCESSING state conceptually but
-                # actually go to a waiting state — we stay PROCESSING
-                # until pending timer fires
-                logger.info("DEBUG AFTER_PROCESSING: pending timer still active, staying PROCESSING")
+                logger.info("PENDING BUFFER ACTIVE: %d messages, waiting for timer",
+                            len(self.pending_buffer))
                 return
 
             self._set_state(BufferState.IDLE)
-        logger.info("DEBUG AFTER_PROCESSING: lock released")
-
-    async def _cancel_current(self) -> None:
-        """
-        Cancel the currently active Claude process.
-
-        Looks up the process by session_id via the API, then sends a DELETE.
-        Also cancels the internal processing task.
-        """
-        logger.info("DEBUG CANCEL: starting cancel_current, lock.locked=%s", self._lock.locked())
-        session_id = self._load_session_id()
-        logger.info("DEBUG CANCEL: getting active process for session=%s", session_id)
-        process_id = await claude_client.get_active_process(session_id)
-        if process_id:
-            logger.info("DEBUG CANCEL: cancelling process=%s on API", process_id)
-            await claude_client.cancel_process(process_id)
-            logger.info("DEBUG CANCEL: API cancel done")
-        else:
-            logger.info("DEBUG CANCEL: no active process found")
-        if self._processing_task and not self._processing_task.done():
-            logger.info("DEBUG CANCEL: cancelling asyncio task...")
-            self._processing_task.cancel()
-            logger.info("DEBUG CANCEL: awaiting cancelled task (task._run will call _after_processing which needs lock!)...")
-            try:
-                await self._processing_task
-            except asyncio.CancelledError:
-                logger.info("DEBUG CANCEL: task raised CancelledError (expected)")
-            logger.info("DEBUG CANCEL: task await completed")
-        else:
-            logger.info("DEBUG CANCEL: no processing task to cancel (task=%s, done=%s)",
-                        self._processing_task, self._processing_task.done() if self._processing_task else "N/A")
-        logger.info("DEBUG CANCEL: cancel_current finished")
 
 
 # Singleton instance used across the application

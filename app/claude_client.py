@@ -1,9 +1,8 @@
 """
 Claude Code API client with SSE streaming support.
 
-Handles communication with claudecode2api: sending chat requests,
-parsing SSE event streams, cancelling active processes, and
-checking process status. All operations are async using httpx.
+Handles communication with claudecode2api: sending chat requests
+and parsing SSE event streams. All operations are async using httpx.
 """
 
 from __future__ import annotations
@@ -27,21 +26,17 @@ class ClaudeResponse:
 
     Attributes:
         session_id: Session identifier returned by the API.
-        process_id: Process identifier for cancellation.
         text: Accumulated text response from the assistant.
         tool_calls: List of tool invocations with their results.
         total_cost_usd: Total cost of the request.
         is_error: Whether the final result was an error.
-        cancelled: Whether the request was cancelled.
         started_at: Timestamp when the request started.
     """
     session_id: str | None = None
-    process_id: str | None = None
     text: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     total_cost_usd: float = 0.0
     is_error: bool = False
-    cancelled: bool = False
     started_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -129,8 +124,6 @@ async def send_chat(
                 _process_event(data, event_type, response, on_text, on_tool_use, on_tool_result)
 
                 if event_type == "done":
-                    if "process_id" in data:
-                        response.process_id = data["process_id"]
                     break
 
     return response
@@ -232,61 +225,3 @@ def _summarize_tool_input(tool_name: str, tool_input: dict) -> str:
     if tool_name == "Read":
         return tool_input.get("file_path", str(tool_input))
     return json.dumps(tool_input, ensure_ascii=False)[:150]
-
-
-async def cancel_process(process_id: str) -> bool:
-    """
-    Cancel an active Claude process by its ID.
-
-    Sends a DELETE request to /chat/{process_id} on the Claude API.
-
-    Args:
-        process_id: The UUID of the process to cancel.
-
-    Returns:
-        True if cancellation succeeded, False otherwise.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.delete(
-                f"{config.claude_api_url}/chat/{process_id}",
-                auth=_auth(),
-            )
-            if resp.status_code == 200:
-                logger.info("CLAUDE CANCEL: process=%s", process_id)
-                return True
-            logger.warning("CLAUDE CANCEL FAILED: %s %s", resp.status_code, resp.text)
-            return False
-    except Exception as e:
-        logger.error("CLAUDE CANCEL ERROR: %s", e)
-        return False
-
-
-async def get_active_process(session_id: str | None) -> str | None:
-    """
-    Find the active process ID for a given session.
-
-    Queries GET /processes on the Claude API and matches by session_id.
-
-    Args:
-        session_id: The session ID to look up.
-
-    Returns:
-        The process_id string if found, None otherwise.
-    """
-    if not session_id:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{config.claude_api_url}/processes",
-                auth=_auth(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            for proc in data.get("processes", []):
-                if proc.get("session_id") == session_id:
-                    return proc.get("process_id")
-    except Exception as e:
-        logger.error("CLAUDE PROCESSES ERROR: %s", e)
-    return None

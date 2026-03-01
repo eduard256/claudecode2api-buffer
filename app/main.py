@@ -50,7 +50,6 @@ async def lifespan(app: FastAPI):
     # Graceful shutdown: cancel timers
     from app.buffer import buffer
     buffer._cancel_timer()
-    buffer._cancel_pending_timer()
     logger.info("SHUTDOWN: cleanup complete")
 
 
